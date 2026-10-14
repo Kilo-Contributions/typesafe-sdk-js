@@ -1,4 +1,5 @@
 export { APIPromise, type WithResponse } from "./api-promise";
+export { Image, image, type TextWithAssets, withAssets } from "./assets";
 export { TypeSafeClient } from "./client";
 export { ENV, type EnvVar } from "./env";
 export {
@@ -16,7 +17,7 @@ export {
   UnprocessableEntityError,
 } from "./errors";
 export { LOG_LEVELS } from "./logging";
-export { choice, noul, score } from "./questions";
+export { box, choice, noul, score } from "./questions";
 export type { Models } from "./resources/models";
 export type * from "./types";
 export { VERSION } from "./version";

@@ -1,6 +1,6 @@
 {
   "name": "@typesafe-ai/sdk",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "TypeScript SDK for the TypeSafe API",
   "license": "MIT",
   "author": "evinism",
@@ -28,7 +28,7 @@
   ],
   "sideEffects": false,
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "packageManager": "npm@11.19.0",
   "scripts": {
@@ -72,7 +72,7 @@
     "type": "git",
     "url": "git+https://github.com/typesafe-ai/typesafe-sdk-js.git"
   },
-  "homepage": "https://docs.typesafe.ai/sdk/javascript",
+  "homepage": "https://docs.typesafe.ai/go/js-sdk",
   "bugs": {
     "url": "https://github.com/typesafe-ai/typesafe-sdk-js/issues"
   }

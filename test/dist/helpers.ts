@@ -51,6 +51,7 @@ export const EXPECTED_VALUE_EXPORTS: string[] = [
   "AuthenticationError",
   "BadRequestError",
   "ENV",
+  "Image",
   "InternalServerError",
   "LOG_LEVELS",
   "NotFoundError",
@@ -60,7 +61,10 @@ export const EXPECTED_VALUE_EXPORTS: string[] = [
   "TypeSafeError",
   "UnprocessableEntityError",
   "VERSION",
+  "box",
   "choice",
+  "image",
   "noul",
   "score",
+  "withAssets",
 ].sort();

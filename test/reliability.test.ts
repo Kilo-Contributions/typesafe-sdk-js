@@ -165,7 +165,7 @@ describe("retries", () => {
     expect(retryHeader(2)).toBe("2");
   });
 
-  it("rejects invalid maxRetries from config or per call", () => {
+  it("rejects invalid maxRetries from config or per call", async () => {
     expect(() => new TypeSafeClient({ apiKey: "k", retry: { maxRetries: -1 } })).toThrow(
       TypeSafeError,
     );
@@ -176,7 +176,9 @@ describe("retries", () => {
       apiKey: "k",
       fetch: mockFetch(() => json({ models: [] })).fetch,
     });
-    expect(() => client.models.list({ retry: { maxRetries: -1 } })).toThrow("retry.maxRetries");
+    await expect(client.models.list({ retry: { maxRetries: -1 } })).rejects.toThrow(
+      "retry.maxRetries",
+    );
   });
 });
 
@@ -399,7 +401,7 @@ describe("retry policy", () => {
     expect(client.retry.maxRetries).toBe(5);
   });
 
-  it("validates every numeric field and names it", () => {
+  it("validates every numeric field and names it", async () => {
     const bad = (retry: Partial<RetryPolicy>) => () => new TypeSafeClient({ apiKey: "k", retry });
     expect(bad({ backoffInitialMs: -1 })).toThrow("retry.backoffInitialMs");
     expect(bad({ backoffMaxMs: Number.NaN })).toThrow("retry.backoffMaxMs");
@@ -415,7 +417,7 @@ describe("retry policy", () => {
       apiKey: "k",
       fetch: mockFetch(() => json({ models: [] })).fetch,
     });
-    expect(() => client.models.list({ retry: { backoffJitter: 2 } })).toThrow(
+    await expect(client.models.list({ retry: { backoffJitter: 2 } })).rejects.toThrow(
       "retry.backoffJitter",
     );
   });
@@ -521,7 +523,7 @@ describe("timeouts", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("rejects invalid timeouts from config or per call", () => {
+  it("rejects invalid timeouts from config or per call", async () => {
     expect(() => new TypeSafeClient({ apiKey: "k", timeout: 0 })).toThrow("timeout");
     expect(() => new TypeSafeClient({ apiKey: "k", timeout: Number.POSITIVE_INFINITY })).toThrow(
       TypeSafeError,
@@ -530,7 +532,7 @@ describe("timeouts", () => {
       apiKey: "k",
       fetch: mockFetch(() => json({ models: [] })).fetch,
     });
-    expect(() => client.models.list({ timeout: -5 })).toThrow("timeout");
+    await expect(client.models.list({ timeout: -5 })).rejects.toThrow("timeout");
   });
 });
 

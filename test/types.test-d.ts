@@ -1,8 +1,14 @@
 import { describe, expectTypeOf, it } from "vitest";
 import {
   type APIPromise,
+  type Asset,
+  type BoxResponse,
+  box,
   type ChoiceResponse,
   choice,
+  type EntryType,
+  Image,
+  image,
   type ModelCard,
   type NoulQuestion,
   type NoulResponse,
@@ -12,8 +18,10 @@ import {
   type ScoreResponse,
   type SystemOneResult,
   score,
+  type TextWithAssets,
   type TypeSafeClient,
   type WithResponse,
+  withAssets,
 } from "../src";
 
 declare const client: TypeSafeClient;
@@ -26,11 +34,18 @@ describe("systemOne result inference", () => {
         a: noul("x"),
         b: choice("y", { yes: null, no: "desc" }),
         c: score("z", ["bad", "ok"]),
+        box: box(image(new Uint8Array())),
+        rawBox: { type: "box" },
       },
     });
 
     expectTypeOf(r.answers.a).toEqualTypeOf<NoulResponse>();
+    expectTypeOf(r.answers.box).toEqualTypeOf<BoxResponse>();
+    expectTypeOf(r.answers.rawBox.box.top).toEqualTypeOf<number>();
+    expectTypeOf(r.answers.rawBox.confidence).toEqualTypeOf<number | null>();
     expectTypeOf(r.answers.a.noul).toEqualTypeOf<number>();
+    expectTypeOf(r.usage.input_tokens).toEqualTypeOf<number | null>();
+    expectTypeOf(r.usage.output_tokens).toEqualTypeOf<number | null>();
 
     expectTypeOf(r.answers.b).toEqualTypeOf<
       ChoiceResponse<{ readonly yes: null; readonly no: "desc" }>
@@ -88,6 +103,18 @@ describe("systemOne result inference", () => {
     const r = await client.systemOne({ state: "s", questions: { c: score("z", list) } });
     expectTypeOf(r.answers.c.probabilities).toEqualTypeOf<{ readonly [score: number]: number }>();
     expectTypeOf(r.answers.c.legend).toEqualTypeOf<{ readonly [score: number]: string }>();
+  });
+
+  it("accepts score lists built at runtime, with numeric indexing", async () => {
+    const levels: string[] = ["bad", "ok", "great"];
+    const r = await client.systemOne({ state: "s", questions: { c: score("z", levels) } });
+    expectTypeOf(r.answers.c.probabilities).toEqualTypeOf<{ readonly [score: number]: number }>();
+    expectTypeOf(r.answers.c.legend).toEqualTypeOf<{ readonly [score: number]: string }>();
+    const mixed: readonly (string | null)[] = ["bad", null];
+    expectTypeOf(score("z", mixed)).toMatchTypeOf<Question>();
+    const numbers: number[] = [1, 2];
+    // @ts-expect-error numbers are not valid descriptions
+    score("q", numbers);
   });
 
   it("results are readonly", async () => {
@@ -154,9 +181,6 @@ describe("criteria shapes", () => {
     score("q", []);
     // @ts-expect-error a rubric needs at least two levels
     score("q", ["only"]);
-    const dynamic: string[] = ["bad", "ok"];
-    // @ts-expect-error a plain string[] may be empty
-    score("q", dynamic);
     // @ts-expect-error inference is a client method, not a resource
     client.systemOne.run({ state: "s", questions: { q: noul("?") } });
   });
@@ -169,9 +193,9 @@ describe("question helpers", () => {
     // @ts-expect-error numbers are not valid descriptions
     score("q", [1, 2]);
     score("q", ["ok", null]);
-    noul(null, { true: null, false: null });
-    noul(null, null);
-    noul();
+    noul(null, { true: "spam" });
+    noul(undefined, { true: null, false: "ham" });
+    noul("q", null);
     choice(null, { yes: null });
     score(null, [null, null]);
     choice("q", { yes: null, no: "ok", maybe: { detail: "rich" } });
@@ -180,11 +204,38 @@ describe("question helpers", () => {
     noul("q", { false: "only one side" });
   });
 
+  it("requires noul instructions or a described outcome", () => {
+    const instructions = undefined as EntryType | undefined;
+    noul(instructions, { true: "spam" });
+    // @ts-expect-error optional instructions need a described outcome
+    noul(instructions);
+    const criteria: NoulQuestion["criteria"] = { true: "spam" };
+    // @ts-expect-error instructions or criteria are required
+    noul();
+    // @ts-expect-error instructions or criteria are required
+    noul(null);
+    // @ts-expect-error criteria must describe an outcome
+    noul(null, {});
+    // @ts-expect-error criteria must describe an outcome
+    noul(null, { true: null, false: null });
+    // @ts-expect-error the criteria type does not guarantee a described outcome
+    noul(null, criteria);
+    // @ts-expect-error criteria without a described outcome
+    noul(null, null);
+  });
+
+  it("requires state", () => {
+    // @ts-expect-error state cannot be null
+    client.systemOne({ state: null, questions: { q: noul("?") } });
+    // @ts-expect-error state is required
+    client.systemOne({ questions: { q: noul("?") } });
+  });
+
   it("preserves result inference with nulls, arrays, and omitted instructions", async () => {
     const r = await client.systemOne({
-      state: null,
+      state: "s",
       questions: {
-        noul: { type: "noul" },
+        noul: { type: "noul", criteria: { true: "spam" } },
         choice: { type: "choice", criteria: { yes: null, no: [null, "example"] } },
         list: score(null, [null, "high"]),
         literal: { type: "score", criteria: [null, "high"] },
@@ -216,6 +267,61 @@ describe("question helpers", () => {
     expectTypeOf(choice("x", { a: null })).toMatchTypeOf<Question>();
     expectTypeOf(choice("x", { a: null, b: null })).toMatchTypeOf<Question>();
     expectTypeOf(score("x", ["a", "b"])).toMatchTypeOf<Question>();
+    expectTypeOf(box("x")).toMatchTypeOf<Question>();
+  });
+});
+
+describe("image assets", () => {
+  it("accept bytes and Blobs, or base64 text with Image.fromBase64", () => {
+    expectTypeOf(image(new Uint8Array())).toEqualTypeOf<Asset>();
+    expectTypeOf(image(new ArrayBuffer(1))).toEqualTypeOf<Asset>();
+    expectTypeOf(image(new Blob([]))).toEqualTypeOf<Asset>();
+    expectTypeOf(Image.fromBase64("aGk=")).toEqualTypeOf<Asset>();
+    // @ts-expect-error base64 text goes through Image.fromBase64
+    image("aGk=");
+    // @ts-expect-error the format is detected from the bytes
+    image(new Uint8Array(), "png");
+  });
+
+  it("are passed to systemOne inline, in withAssets text, or by reference", () => {
+    const photo = image(new Uint8Array([1]));
+    expectTypeOf(withAssets`Compare ${photo}`).toEqualTypeOf<TextWithAssets>();
+    expectTypeOf(withAssets.join([photo, "text"], ", ")).toEqualTypeOf<TextWithAssets>();
+    client.systemOne({ state: photo, questions: { q: noul([photo]) } });
+    client.systemOne({
+      state: { photos: [photo], caption: withAssets`${photo}` },
+      questions: { q: score(withAssets`Rate ${photo}`, [null, { example: photo }]) },
+    });
+    client.systemOne({
+      state: "<photo>",
+      questions: { q: noul("?") },
+      assets: { "<photo>": photo },
+    });
+    client.systemOne({
+      state: "<photo>",
+      questions: { q: noul("?") },
+      // @ts-expect-error assets maps references to images
+      assets: [photo],
+    });
+    client.systemOne({
+      state: "<photo>",
+      questions: { q: noul("?") },
+      // @ts-expect-error assets must be created by image
+      assets: { "<photo>": "aGk=" },
+    });
+  });
+
+  it("type images and withAssets text in a score legend as strings", async () => {
+    const photo = image(new Uint8Array([1]));
+    const r = await client.systemOne({
+      state: "s",
+      questions: { q: score("z", [photo, withAssets`${photo}`, { examples: [photo] }]) },
+    });
+    expectTypeOf(r.answers.q.legend).toEqualTypeOf<{
+      readonly 0: string;
+      readonly 1: string;
+      readonly 2: { readonly examples: readonly [string] };
+    }>();
   });
 });
 

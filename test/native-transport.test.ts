@@ -1,6 +1,7 @@
 import { createServer, type RequestListener } from "node:http";
+import { zstdDecompressSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
-import { APITimeoutError, APIUserAbortError, noul, TypeSafeClient } from "../src";
+import { APITimeoutError, APIUserAbortError, image, noul, TypeSafeClient } from "../src";
 
 /** Real fetch/socket coverage: mocks do not reproduce the headers/body lifecycle. */
 const withServer = async (
@@ -50,6 +51,47 @@ describe("native response transport", () => {
       "x-team": "call",
       "content-type": "application/json",
     });
+  });
+
+  it("sends a zstd multipart body with its boundary and resends the same bytes on retry", async () => {
+    const received: {
+      contentType: string | undefined;
+      contentEncoding: string | undefined;
+      body: Buffer;
+    }[] = [];
+    await withServer(
+      (req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk: Buffer) => chunks.push(chunk));
+        req.on("end", () => {
+          received.push({
+            contentType: req.headers["content-type"],
+            contentEncoding: req.headers["content-encoding"],
+            body: Buffer.concat(chunks),
+          });
+          res.writeHead(received.length === 1 ? 503 : 200, { "content-type": "application/json" });
+          res.end("{}");
+        });
+      },
+      async (baseURL) => {
+        await new TypeSafeClient({
+          apiKey: "k",
+          baseURL,
+          retry: { backoffInitialMs: 0, backoffMaxMs: 0 },
+        }).systemOne({
+          state: image(new Uint8Array(1024).fill(0x50)),
+          questions: { q: noul("?") },
+        });
+      },
+    );
+    expect(received).toHaveLength(2);
+    const [first, second] = received;
+    const boundary = /^multipart\/form-data; boundary=(\w+)$/.exec(first?.contentType ?? "")?.[1];
+    expect(first?.contentEncoding).toBe("zstd");
+    const body = zstdDecompressSync(first?.body ?? Buffer.alloc(0));
+    expect(body.toString("latin1")).toContain(`--${boundary}--`);
+    expect(body.includes(Buffer.alloc(1024, 0x50))).toBe(true);
+    expect(second).toEqual(first);
   });
 
   it.each([200, 503])(

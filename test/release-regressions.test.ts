@@ -75,7 +75,7 @@ describe("release regressions", () => {
     const original = JSON.stringify(questions);
     const { fetch, requests } = mockFetch(() => json({}));
     await new TypeSafeClient({ apiKey: "k", fetch }).systemOne({ state: "s", questions });
-    const body = JSON.parse(String(requests[0]?.init?.body));
+    const body = JSON.parse(String(requests[0]?.raw));
     expect(Object.hasOwn(body.questions, "__proto__")).toBe(true);
     expect(Object.getOwnPropertyDescriptor(body.questions, "__proto__")?.value).toEqual(noul("?"));
     expect(body.questions.score.criteria).toEqual(["no", "yes"]);

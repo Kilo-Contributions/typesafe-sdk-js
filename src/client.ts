@@ -1,4 +1,11 @@
 import { APIPromise, requestIdFrom } from "./api-promise";
+import { copyAssetBytes, encodeAssets, MultipartBody, serializeRequest } from "./assets";
+import {
+  byteLength,
+  compressBody,
+  MIN_COMPRESSED_BODY_BYTES,
+  resolveCompression,
+} from "./compression";
 import { ENV, fromCodeOrEnv, readEnv } from "./env";
 import {
   APIConnectionError,
@@ -25,6 +32,7 @@ import {
 } from "./retry";
 import { describeRuntime, isBrowser } from "./runtime";
 import type {
+  Compression,
   Fetch,
   Logger,
   LogLevel,
@@ -32,7 +40,6 @@ import type {
   RequestOptions,
   RetryPolicy,
   SystemOneRequest,
-  SystemOneRequestPayload,
   SystemOneResult,
   TypeSafeClientConfig,
 } from "./types";
@@ -181,10 +188,13 @@ const mergeHeaders = (
 const bufferResponse = async (response: Response, signal: AbortSignal): Promise<void> => {
   const reader = response.clone().body?.getReader();
   if (!reader) return;
+  // Node.js 22's fetch cancels an unlocked response body on abort and leaves the rejection
+  // unhandled, so the original body is locked while the clone is read.
+  const original = response.body?.getReader();
   const cancel = (): void => {
     // Cancel both tee branches without waiting for an underlying source to acknowledge it.
     void reader.cancel(signal.reason).catch(() => {});
-    void response.body?.cancel(signal.reason).catch(() => {});
+    void original?.cancel(signal.reason).catch(() => {});
   };
   signal.addEventListener("abort", cancel, { once: true });
   try {
@@ -197,7 +207,31 @@ const bufferResponse = async (response: Response, signal: AbortSignal): Promise<
   } finally {
     signal.removeEventListener("abort", cancel);
     reader.releaseLock();
+    original?.releaseLock();
   }
+};
+
+/**
+ * Call `start` and settle with its result, or reject with the signal's reason when the signal
+ * aborts first. `start` isn't called if the signal has already aborted.
+ */
+const untilAborted = <T>(start: () => Promise<T>, signal: AbortSignal | undefined): Promise<T> => {
+  if (signal === undefined) return start();
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    const onAbort = (): void => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    start().then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
 };
 
 // ---------------------------------------------------------------------------
@@ -206,7 +240,10 @@ const bufferResponse = async (response: Response, signal: AbortSignal): Promise<
 
 type Method = "GET" | "POST";
 
-/** Per-call transport options with an optional JSON body. */
+/**
+ * Per-call transport options with an optional JSON body or `MultipartBody`, or a function called
+ * at send time that returns a promise for one.
+ */
 export interface RawRequestOptions extends RequestOptions {
   body?: unknown;
 }
@@ -230,6 +267,12 @@ interface ResolvedRequest {
 /** Runtime description cached for the process lifetime. */
 const RUNTIME = describeRuntime();
 
+/** An `APIPromise` rejected with `err`, for failures found before a request is sent. */
+const rejectedAPIPromise = <T>(err: unknown): APIPromise<T> => {
+  const response = Promise.reject(err);
+  return new APIPromise<T>(response, () => response as Promise<T>);
+};
+
 /** Client for the TypeSafe AI API. */
 export class TypeSafeClient {
   /** API key excluded from serialization and public properties. */
@@ -248,6 +291,8 @@ export class TypeSafeClient {
   readonly timeout: number;
   /** Additional headers sent with each request. */
   readonly defaultHeaders: Readonly<Record<string, string>>;
+  /** Request body compression, or `false` when bodies are sent uncompressed. */
+  readonly compression: Compression;
   /** HTTP fetch implementation. */
   readonly fetch: Fetch;
 
@@ -262,7 +307,8 @@ export class TypeSafeClient {
    * Explicit options take precedence over environment variables, then SDK defaults.
    * Empty or whitespace-only environment values are ignored.
    *
-   * @throws {TypeSafeError} The API key is missing, configuration is invalid, or the runtime is unsupported.
+   * @throws {TypeSafeError} The API key is missing, configuration is invalid, the runtime is
+   *   unsupported, or the runtime lacks the requested compression.
    */
   constructor(config: TypeSafeClientConfig = {}) {
     if (isBrowser() && !config.dangerouslyAllowBrowser) refuseBrowser();
@@ -277,6 +323,7 @@ export class TypeSafeClient {
     this.retry = resolveRetryPolicy(DEFAULT_RETRY_POLICY, config.retry);
     this.timeout = assertPositiveMs("timeout", config.timeout ?? DEFAULT_TIMEOUT_MS);
     this.defaultHeaders = { ...config.defaultHeaders };
+    this.compression = resolveCompression(config.compression);
 
     if (config.fetch === undefined && typeof globalThis.fetch !== "function") missingFetch();
     this.fetch = config.fetch ?? defaultFetch;
@@ -289,12 +336,18 @@ export class TypeSafeClient {
   }
 
   /**
-   * Answer named questions about text or structured state.
+   * Answer named questions about text, structured state, or assets.
    *
-   * @param request - State, questions, and an optional model override.
+   * @param request - State, questions, an optional model override, and optional assets.
+   *   Assets in `state`, question content, or `withAssets` text are sent under their references.
    * @param options - Per-call timeout, retry, headers, and cancellation settings.
-   * @returns Answers typed by question name and criteria, with model and token usage.
-   * @throws {TypeSafeError} Questions are empty, or score criteria are not a list of at least two entries.
+   * @returns Answers typed by question name and criteria, with model and token usage. Every
+   *   failure below rejects the returned promise; the call itself doesn't throw.
+   * @throws {TypeSafeError} State is `null` or omitted, questions are empty, score criteria are not
+   *   a list of at least two entries, choice criteria are not a nonempty map, a noul question has
+   *   neither instructions nor a described outcome, a string holds the reference of an asset not
+   *   attached to the request, a name in `assets` doesn't appear in the request, or a `Blob`
+   *   asset can't be read.
    * @throws {APIError} The server returns a non-2xx response after retries.
    * @throws {APIConnectionError} The request cannot connect or times out after retries.
    * @throws {APIUserAbortError} The caller aborts the request.
@@ -312,11 +365,22 @@ export class TypeSafeClient {
     request: SystemOneRequest<Q>,
     options: RequestOptions = {},
   ): APIPromise<SystemOneResult<Q>> {
-    validateQuestions(request.questions);
-    const body = {
-      ...request,
-      model: request.model ?? this.defaultModel,
-    } satisfies SystemOneRequestPayload;
+    let body: unknown;
+    try {
+      if (request.state == null) throw new TypeSafeError("State is required.");
+      validateQuestions(request.questions);
+      const { assets, ...rest } = request;
+      // Serialized now, so changes to the request after this call don't change what is sent.
+      const { json, assets: sent } = serializeRequest(
+        { ...rest, model: request.model ?? this.defaultModel },
+        assets,
+      );
+      const payload: object = JSON.parse(json);
+      const copied = sent === undefined ? undefined : copyAssetBytes(sent);
+      body = copied === undefined ? payload : () => encodeAssets(payload, copied);
+    } catch (err) {
+      return rejectedAPIPromise(err);
+    }
 
     return this.#request<SystemOneResult<Q>>("POST", "/v1/systemone", {
       ...options,
@@ -326,16 +390,23 @@ export class TypeSafeClient {
 
   /** Send a request and parse its response body. */
   #request<T>(method: Method, path: string, options: RawRequestOptions = {}): APIPromise<T> {
-    const resolved: ResolvedRequest = {
-      method,
-      path,
-      body: options.body,
-      headers: mergeHeaders(this.defaultHeaders, options.headers ?? {}),
-      signal: options.signal,
-      timeout:
-        options.timeout === undefined ? this.timeout : assertPositiveMs("timeout", options.timeout),
-      retry: resolveRetryPolicy(this.retry, options.retry),
-    };
+    let resolved: ResolvedRequest;
+    try {
+      resolved = {
+        method,
+        path,
+        body: options.body,
+        headers: mergeHeaders(this.defaultHeaders, options.headers ?? {}),
+        signal: options.signal,
+        timeout:
+          options.timeout === undefined
+            ? this.timeout
+            : assertPositiveMs("timeout", options.timeout),
+        retry: resolveRetryPolicy(this.retry, options.retry),
+      };
+    } catch (err) {
+      return rejectedAPIPromise(err);
+    }
     // Numbered so concurrent requests, and the attempts within one, can be told apart in the logs.
     const tag = `#${++this.#requestCount} ${method} ${path}`;
 
@@ -349,17 +420,47 @@ export class TypeSafeClient {
   /** Retry eligible failures, logging attempt summaries at `info` and headers and bodies at `debug`. */
   private async fetchWithRetries(tag: string, req: ResolvedRequest): Promise<Response> {
     const url = `${this.baseURL}${req.path}`;
-    // User-supplied headers go first so they can't clobber auth or the JSON content type.
+    let resolved = req.body;
+    if (typeof resolved === "function") {
+      try {
+        resolved = await untilAborted(resolved as () => Promise<unknown>, req.signal);
+      } catch (err) {
+        if (!req.signal?.aborted) throw err;
+        this.logger.info(`${tag} aborted by caller while reading assets`);
+        throw new APIUserAbortError(undefined, { cause: err });
+      }
+    }
+    const multipart = resolved instanceof MultipartBody ? resolved : undefined;
+    const payload = multipart === undefined ? resolved : multipart.payload;
+    const encoded =
+      multipart?.content ?? (payload === undefined ? undefined : JSON.stringify(payload));
+    const encoding =
+      encoded === undefined || byteLength(encoded) < MIN_COMPRESSED_BODY_BYTES
+        ? false
+        : this.compression;
+    // Compressed once and sent as-is on every attempt; the logs show the uncompressed payload.
+    let body: string | Blob | Uint8Array<ArrayBuffer> | undefined = encoded;
+    if (encoded !== undefined && encoding !== false) {
+      try {
+        body = await untilAborted(() => compressBody(encoded), req.signal);
+      } catch (err) {
+        if (!req.signal?.aborted) throw err;
+        this.logger.info(`${tag} aborted by caller while compressing the body`);
+        throw new APIUserAbortError(undefined, { cause: err });
+      }
+    }
+    // User-supplied headers go first so they can't clobber auth, the content type, or the encoding.
     const headers = mergeHeaders(req.headers, {
       Authorization: `Bearer ${this.#apiKey}`,
       Accept: "application/json",
       "User-Agent": `typesafe-sdk/${VERSION}`,
       "X-TypeSafe-SDK": `typesafe-sdk/${VERSION}`,
       "X-TypeSafe-Runtime": RUNTIME,
-      "Content-Type": req.body === undefined ? undefined : "application/json",
+      "Content-Type":
+        multipart?.contentType ?? (body === undefined ? undefined : "application/json"),
+      "Content-Encoding": encoding === false ? undefined : encoding,
       "X-TypeSafe-Retry-Count": undefined,
     });
-    const body = req.body === undefined ? undefined : JSON.stringify(req.body);
 
     for (let attempt = 0; ; attempt++) {
       const retriesLeft = req.retry.maxRetries - attempt;
@@ -367,7 +468,7 @@ export class TypeSafeClient {
         attempt === 0 ? headers : { ...headers, "X-TypeSafe-Retry-Count": String(attempt) };
       this.logger.debug(`${tag} -> ${url}`, {
         headers: redactHeaders(attemptHeaders),
-        body: req.body,
+        body: payload,
       });
 
       const started = Date.now();
@@ -407,7 +508,11 @@ export class TypeSafeClient {
   private async attempt(
     tag: string,
     url: string,
-    init: { method: Method; headers: Record<string, string>; body: string | undefined },
+    init: {
+      method: Method;
+      headers: Record<string, string>;
+      body: string | Blob | Uint8Array<ArrayBuffer> | undefined;
+    },
     { signal, timeout }: ResolvedRequest,
   ): Promise<Response> {
     const controller = new AbortController();

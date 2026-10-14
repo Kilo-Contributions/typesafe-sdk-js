@@ -3,13 +3,16 @@ import {
   type APIError,
   AuthenticationError,
   BadRequestError,
+  box,
   choice,
   ENV,
+  Image,
   noul,
   score,
   TypeSafeClient,
   TypeSafeError,
   UnprocessableEntityError,
+  withAssets,
 } from "../../src";
 
 /** Live API tests with raw response output; skipped unless `TYPESAFE_API_KEY` is set. */
@@ -62,8 +65,10 @@ describeLive("live API", () => {
     show("POST /v1/systemone", { requestId, data });
 
     expect(typeof data.model).toBe("string");
-    expect(data.usage.input_tokens).toBeGreaterThan(0);
-    expect(data.usage.output_tokens).toBeGreaterThanOrEqual(0);
+    // The API sends null token counts when it doesn't report usage.
+    const { input_tokens, output_tokens } = data.usage;
+    if (input_tokens !== null) expect(input_tokens).toBeGreaterThan(0);
+    if (output_tokens !== null) expect(output_tokens).toBeGreaterThanOrEqual(0);
 
     const { isBilling, sentiment, urgency } = data.answers;
     expect(isBilling.type).toBe("noul");
@@ -137,12 +142,105 @@ describeLive("live API", () => {
     expect((err as Error).message).toMatch(/^422 questions\.q\.score\.criteria\.0/);
   });
 
-  it("catches shapes the API would reject before sending", () => {
-    expect(() => client.systemOne({ state: "x", questions: {} })).toThrow(TypeSafeError);
+  it("catches shapes the API would reject before sending", async () => {
+    await expect(client.systemOne({ state: "x", questions: {} })).rejects.toThrow(TypeSafeError);
     // biome-ignore lint/suspicious/noExplicitAny: deliberately malformed, as a JS caller might send
     const empty: any = [];
-    expect(() => client.systemOne({ state: "x", questions: { q: score("?", empty) } })).toThrow(
-      TypeSafeError,
-    );
+    await expect(
+      client.systemOne({ state: "x", questions: { q: score("?", empty) } }),
+    ).rejects.toThrow(TypeSafeError);
+  });
+});
+
+/** Live image tests; skipped unless `TYPESAFE_LIVE_IMAGES` is set, for an API that accepts images. */
+const describeLiveImages =
+  process.env[ENV.apiKey] && process.env.TYPESAFE_LIVE_IMAGES ? describe : describe.skip;
+
+/** A 512x512 solid red PNG. */
+const RED =
+  "iVBORw0KGgoAAAANSUhEUgAAAgAAAAIAAQMAAADOtka5AAAABlBMVEX/AAAAAABBoxIDAAAANklEQVR42u3BAQEAAACCIP+v" +
+  "bkhAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB8G4IAAAFjdVCkAAAAAElFTkSuQmCC";
+
+/** A 512x512 solid blue PNG. */
+const BLUE =
+  "iVBORw0KGgoAAAANSUhEUgAAAgAAAAIAAQMAAADOtka5AAAABlBMVEUAAP8AAAB7Yr8+AAAANklEQVR42u3BAQEAAACCIP+v" +
+  "bkhAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB8G4IAAAFjdVCkAAAAAElFTkSuQmCC";
+
+/** A 512x512 white PNG with a red square from 128 to 384 pixels on each axis. */
+const RED_SQUARE_ON_WHITE =
+  "iVBORw0KGgoAAAANSUhEUgAAAgAAAAIAAQMAAADOtka5AAAABlBMVEX/////AADrWueTAAAAZ0lEQVR42u3MQQ0AAAgEoOtf" +
+  "WiM4N/1BABIAAAAAAAAAgGM1EAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKB" +
+  "QCD4DgAAAAAAAAAAlhrvN+HSAmCw9gAAAABJRU5ErkJggg==";
+
+describeLiveImages("live API images", () => {
+  const client = new TypeSafeClient({
+    logLevel: "info",
+    timeout: 120_000,
+    defaultHeaders: { "TypeSafe-Danger-Zone-Images": "true" },
+  });
+
+  it("answers about an image in state", async () => {
+    const { answers } = await client.systemOne({
+      state: ["Here is a photo:", Image.fromBase64(RED)],
+      questions: { red: noul("Is the photo a solid red square?") },
+    });
+    show("inline image", answers);
+    expect(answers.red.noul).toBeGreaterThan(0.5);
+  });
+
+  it("answers about an image in withAssets text that is also in assets", async () => {
+    const photo = Image.fromBase64(RED);
+    const { answers } = await client.systemOne({
+      state: withAssets`Compare <photo> with ${photo}.`,
+      questions: { same: noul("Are both photos the same?") },
+      assets: { "<photo>": photo },
+    });
+    show("withAssets image also in assets", answers);
+    expect(answers.same.noul).toBeGreaterThan(0.5);
+  });
+
+  it("answers about an image in question instructions", async () => {
+    const { answers } = await client.systemOne({
+      state: "Look at the image in the question.",
+      questions: { red: noul(["Is this image a solid red square?", Image.fromBase64(RED)]) },
+    });
+    show("image in question", answers);
+    expect(answers.red.noul).toBeGreaterThan(0.5);
+  });
+
+  it("compares the state image with images in question criteria", async () => {
+    const { answers } = await client.systemOne({
+      state: Image.fromBase64(RED),
+      questions: {
+        color: choice("Which sample has the same color as the state image?", {
+          red: Image.fromBase64(RED),
+          blue: Image.fromBase64(BLUE),
+        }),
+        similarity: score("How similar is the state image to the examples?", [
+          Image.fromBase64(BLUE),
+          Image.fromBase64(RED),
+        ]),
+      },
+    });
+    show("images in criteria", answers);
+    expect(answers.color.choice).toBe("red");
+    expect(answers.similarity.score).toBeGreaterThan(0.5);
+  });
+
+  it("locates the red square with a box question", async () => {
+    const { answers } = await client.systemOne({
+      state: Image.fromBase64(RED_SQUARE_ON_WHITE),
+      questions: { redSquare: box("The red square in the center") },
+      model: "jev-preview",
+    });
+    show("box", answers);
+    const { type, box: coordinates, confidence } = answers.redSquare;
+    const { top, bottom, left, right } = coordinates;
+    expect(type).toBe("box");
+    if (confidence !== null) expect(confidence).toBeGreaterThanOrEqual(0);
+    for (const edge of [top, bottom, left, right]) {
+      expect(edge).toBeGreaterThanOrEqual(0);
+      expect(edge).toBeLessThanOrEqual(1);
+    }
   });
 });

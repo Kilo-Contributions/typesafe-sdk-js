@@ -1,3 +1,5 @@
+import type { Image, TextWithAssets } from "./assets";
+
 /** A JSON-compatible value. */
 export type JsonValue =
   | string
@@ -7,8 +9,33 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-/** Text, a JSON object or array, or `null` for state, instructions, and criteria. */
-export type EntryType = string | { [key: string]: JsonValue } | JsonValue[] | null;
+/**
+ * A JSON-compatible value that may also hold assets, each written as its name in `assets`, or
+ * else as its reference.
+ */
+export type ContentValue =
+  | string
+  | number
+  | boolean
+  | null
+  | Asset
+  | TextWithAssets
+  | ContentValue[]
+  | { [key: string]: ContentValue };
+
+/**
+ * Text, an asset, a JSON object or array, or `null` for instructions and criteria.
+ *
+ * Each asset in it is written as its name in `assets`, or else as its reference, and sent
+ * with the request.
+ */
+export type EntryType =
+  | string
+  | Asset
+  | TextWithAssets
+  | { [key: string]: ContentValue }
+  | ContentValue[]
+  | null;
 
 // ---------------------------------------------------------------------------
 // Questions
@@ -20,9 +47,9 @@ export type Description = EntryType;
 /** A yes/no question with optional descriptions for either outcome. */
 export interface NoulQuestion {
   type: "noul";
-  /** The question as text, a JSON object, or an array; optional or `null`. */
+  /** The question as text, a JSON object, or an array; optional when `criteria` describes an outcome. */
   instructions?: EntryType;
-  /** Optional descriptions of the yes and no outcomes. */
+  /** Descriptions of the yes and no outcomes; at least one is required when `instructions` is omitted or `null`. */
   criteria?: {
     /** Description of the yes outcome. */
     true?: EntryType;
@@ -41,7 +68,7 @@ export interface ChoiceQuestion<T extends ChoiceCriteria = ChoiceCriteria> {
   type: "choice";
   /** The question as text, a JSON object, or an array; optional or `null`. */
   instructions?: EntryType;
-  /** Descriptions of the available outcomes. */
+  /** Descriptions of the available outcomes; at least one label is required. */
   criteria: T;
 }
 
@@ -57,13 +84,27 @@ export interface ScoreQuestion<T extends ScoreCriteria = ScoreCriteria> {
   criteria: T;
 }
 
+/** A question that locates what its instructions describe in the request's image. */
+export interface BoxQuestion {
+  type: "box";
+  /** What to locate, as text, an asset, a JSON object, or an array; optional or `null`. */
+  instructions?: EntryType;
+}
+
 /** A question identified by its `type` field. */
-export type Question = NoulQuestion | ScoreQuestion | ChoiceQuestion;
+export type Question = NoulQuestion | ScoreQuestion | ChoiceQuestion | BoxQuestion;
 
 /** Questions keyed by the names used to identify their answers. */
 export interface Questions {
   [name: string]: Question;
 }
+
+// ---------------------------------------------------------------------------
+// Assets
+// ---------------------------------------------------------------------------
+
+/** An asset sent with a request under a reference. */
+export type Asset = Image;
 
 // ---------------------------------------------------------------------------
 // Responses
@@ -94,9 +135,16 @@ export type ScoreOf<T extends ScoreCriteria> = number extends T["length"]
   ? number
   : Extract<keyof T, `${number}`>;
 
+/** Content as the API returns it, with assets and `withAssets` text written as strings. */
+export type SentContent<T> = T extends Asset | TextWithAssets
+  ? string
+  : T extends object
+    ? { readonly [key in keyof T]: SentContent<T[key]> }
+    : T;
+
 /** Rubric descriptions keyed by score. */
 export type ScoreLegend<T extends ScoreCriteria> = {
-  readonly [score in ScoreOf<T>]: T[score];
+  readonly [score in ScoreOf<T>]: SentContent<T[score]>;
 };
 
 /** An expected score with its rubric and probabilities. */
@@ -114,6 +162,27 @@ export interface ScoreResponse<T extends ScoreCriteria = ScoreCriteria> {
   };
 }
 
+/** A box's edges as fractions of the image's height (`top`, `bottom`) and width (`left`, `right`). */
+export interface BoxCoordinates {
+  /** Top edge, as a fraction of image height from the top, from zero to one. */
+  readonly top: number;
+  /** Bottom edge, as a fraction of image height from the top, from zero to one. */
+  readonly bottom: number;
+  /** Left edge, as a fraction of image width from the left, from zero to one. */
+  readonly left: number;
+  /** Right edge, as a fraction of image width from the left, from zero to one. */
+  readonly right: number;
+}
+
+/** The answer to a `box` question. */
+export interface BoxResponse {
+  readonly type: "box";
+  /** Where the instructions' subject is in the image. */
+  readonly box: BoxCoordinates;
+  /** Confidence in the box, from zero to one, or `null` when the API didn't report it. */
+  readonly confidence: number | null;
+}
+
 /** The answer type for a question, preserving its criteria keys. */
 export type ResultFor<T extends Question> = T extends NoulQuestion
   ? NoulResponse
@@ -121,14 +190,16 @@ export type ResultFor<T extends Question> = T extends NoulQuestion
     ? ScoreResponse<S>
     : T extends ChoiceQuestion<infer E>
       ? ChoiceResponse<E>
-      : never;
+      : T extends BoxQuestion
+        ? BoxResponse
+        : never;
 
 /** Token usage for a request. */
 export interface Usage {
-  /** Number of input tokens used. */
-  readonly input_tokens: number;
-  /** Number of output tokens used. */
-  readonly output_tokens: number;
+  /** Number of input tokens used, or `null` when the API did not report it. */
+  readonly input_tokens: number | null;
+  /** Number of output tokens used, or `null` when the API did not report it. */
+  readonly output_tokens: number | null;
 }
 
 /** Answers keyed by question name, with model and usage metadata. */
@@ -158,17 +229,22 @@ export interface ModelCard {
  * Additional properties on a request variable are forwarded, including `null` values.
  */
 export interface SystemOneRequest<Q extends Questions = Questions> {
-  /** Text, a JSON object or array, or `null` to evaluate. */
-  state: EntryType;
+  /** Text, an asset, a JSON object, or an array to evaluate. */
+  state: NonNullable<EntryType>;
   /** Nonempty questions keyed by the names used to identify their answers. */
   questions: Q;
   /** Model override; omitted values inherit `defaultModel`. */
   model?: string;
-}
-
-/** Request body for `POST /v1/systemone`, with the model resolved. */
-export interface SystemOneRequestPayload extends SystemOneRequest {
-  model: string;
+  /**
+   * References mapped to assets, for referencing assets by name.
+   *
+   * References are matched literally in string values within `state`, question instructions,
+   * or criteria. Use distinct delimiters (such as `<photo>`) to avoid matching ordinary text.
+   * Assets placed directly in `state` or question content, or in `withAssets` text, are sent
+   * without being listed here. Every name must appear in the request; otherwise the call
+   * rejects before sending.
+   */
+  assets?: Record<string, Asset>;
 }
 
 /** Retry configuration. Partial overrides inherit unset fields from the client or SDK defaults. */
@@ -208,6 +284,9 @@ export interface RequestOptions {
 /** HTTP fetch implementation compatible with the global `fetch`. */
 export type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
 
+/** Request body compression: `"zstd"`, or `false` to send bodies uncompressed. */
+export type Compression = "zstd" | false;
+
 /** Log verbosity; `off` disables logging. */
 export type LogLevel = "debug" | "info" | "warn" | "error" | "off";
 
@@ -241,6 +320,13 @@ export interface TypeSafeClientConfig {
   timeout?: number;
   /** Additional request headers; per-call headers take precedence. */
   defaultHeaders?: Record<string, string>;
+  /**
+   * Request body compression, sent as `Content-Encoding`. Default: `"zstd"` on runtimes that
+   * have it (Node.js 22.15 or newer), otherwise `false`. Bodies under 1 KiB are always sent
+   * uncompressed. Pass `false` to send all bodies uncompressed, for example to an API that
+   * doesn't accept compressed requests.
+   */
+  compression?: Compression;
   /** Allow browser use, exposing the API key to page users. Default: false. */
   dangerouslyAllowBrowser?: boolean;
   /** Custom HTTP fetch implementation for transport configuration or tests. Default: global `fetch`. */
